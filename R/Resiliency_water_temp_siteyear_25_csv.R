@@ -8,6 +8,7 @@ library(jsonlite)
 library(ggplot2)
 library(openxlsx)
 
+setwd("C:\\Users\\audreybrown\\OneDrive - DOI\\Documents\\RWork\\Temperature")
 # -----------------------------
 # Connect to Aquarius
 # -----------------------------
@@ -28,12 +29,13 @@ calculate_site_metrics <- function(site_name, record_name, Tth = 28.6) {
     filter(!is.na(date_time)) %>%
     mutate(site = site_name)
   
-  # Filter May–August and aggregate hourly
+  # Filter May–September and aggregate hourly
   temp_hourly <- temp_data %>%
-    filter(month(date_time) %in% 5:8) %>%
+    filter(month(date_time) %in% 5:9) %>%
     group_by(Hour = floor_date(date_time, "hour")) %>%
     summarise(hourly_temp = mean(value, na.rm = TRUE), .groups = "drop") %>%
     mutate(
+      Year = year(Hour),
       HDH_hour = pmax(hourly_temp - Tth, 0),
       CDH_hour = pmin(hourly_temp - Tth, 0),
       above_thresh = hourly_temp > Tth,
@@ -48,7 +50,7 @@ calculate_site_metrics <- function(site_name, record_name, Tth = 28.6) {
   
   # DAILY aggregation
     daily_data <- temp_hourly %>%
-      group_by(Date) %>%
+      group_by(Year, Date) %>%
       summarise(
         daily_HDH = sum(HDH_hour, na.rm = TRUE),
         daily_CDH = sum(CDH_hour, na.rm = TRUE),
@@ -58,19 +60,21 @@ calculate_site_metrics <- function(site_name, record_name, Tth = 28.6) {
         pct_time_above = mean(above_thresh) * 100,
         .groups = "drop"
       ) %>%
-      filter(month(Date) %in% 5:8)   # ← ADD THIS LINE
+      filter(month(Date) %in% 5:9)   # ← ADD THIS LINE
     
   # Identify continuous warming events (any hourly temp > threshold)
   event_hours <- temp_hourly %>%
     arrange(Hour) %>%
-    mutate(
+    group_by(Year) %>%
+     mutate(
       event_id = cumsum(above_thresh & !lag(above_thresh, default = FALSE))
     ) %>%
     filter(above_thresh)
+   
   
-  # Event-level summaries
+  # Event-level summaries per year
   warming_events <- event_hours %>%
-    group_by(event_id) %>%
+    group_by(Year, event_id) %>%
     summarise(
       site = site_name,
       event_start = min(Hour),
@@ -82,7 +86,7 @@ calculate_site_metrics <- function(site_name, record_name, Tth = 28.6) {
       mean_temp = mean(hourly_temp, na.rm = TRUE),
       .groups = "drop"
     ) %>%
-    arrange(desc(Total_HDH))
+    arrange(Year, desc(Total_HDH))
   
   # -----------------------------
   # Calculate warming event summary metrics
@@ -117,21 +121,87 @@ calculate_site_metrics <- function(site_name, record_name, Tth = 28.6) {
       Site_pct_time_above = site_pct_time_above
     )
   
+  
+  # -----------------------------
+  # Calculate warming event summary metrics per year
+  # -----------------------------
+  site_pct_time_above_by_year <- temp_hourly %>%
+    group_by(Year) %>%
+    summarise(
+      Site_pct_time_above = mean(above_thresh) * 100,
+      .groups = "drop"
+    )
+  
+  event_summary_by_year <- daily_data %>% 
+    distinct(Year) %>%          # ensures all years are present
+    left_join(
+      warming_events %>%
+        group_by(Year) %>%
+        summarise(
+          Number_warming_events = n(),
+          Mean_warming_event_duration_days = if (n() > 0) mean(duration_days) else 0,
+          SE_warming_event_duration_days   = if (n() > 0) sd(duration_days) / sqrt(n()) else 0,
+          .groups = "drop"
+        ),
+      by = "Year"
+    ) %>%
+    mutate(
+      Number_warming_events            = replace_na(Number_warming_events, 0),
+      Mean_warming_event_duration_days = replace_na(Mean_warming_event_duration_days, 0),
+      SE_warming_event_duration_days   = replace_na(SE_warming_event_duration_days, 0)
+    )
+  
+  duration_warmest_period_by_year <- daily_data %>%
+    group_by(Year) %>%
+    summarise(
+      Duration_warmest_period_days = {
+        rle_vals <- rle(daily_HDH > 0)
+        if (any(rle_vals$values)) max(rle_vals$lengths[rle_vals$values]) else 0
+      },
+      .groups = "drop"
+    )
+  
+  # Site-level annual summary with same metrics
+  site_summary_annual <- daily_data %>%
+    group_by(Year) %>%
+    summarise(
+      site             = site_name,
+      date_start       = min(Date),
+      date_end         = max(Date),
+      Total_HDH        = sum(daily_HDH),
+      Total_CDH        = sum(daily_CDH),
+      Mean_HDH_daily   = mean(daily_HDH),
+      Mean_CDH_daily   = mean(daily_CDH),
+      Max_HDH_daily    = max(daily_HDH),
+      mean_temp        = mean(mean_temp),
+      max_temp         = max(max_temp),
+      min_temp         = min(min_temp),
+      n_days           = n(),
+      .groups          = "drop"
+    ) %>%
+    left_join(duration_warmest_period_by_year, by = "Year") %>%
+    left_join(event_summary_by_year,          by = "Year") %>%
+    left_join(site_pct_time_above_by_year,    by = "Year") %>%
+    relocate(n_days,.after = SE_warming_event_duration_days)%>%
+    arrange(Year)
+  
+  
   # Return all outputs
   return(list(
     raw_data = temp_data,
     hourly_data = temp_hourly,
     daily_data = daily_data,
     warming_events = warming_events,
-    site_summary = site_summary
+    site_summary = site_summary,
+    site_summary_annual = site_summary_annual
   ))
 }
 
 # -----------------------------
 # RUN ANALYSIS
 # -----------------------------
-site_name <- "CACO_Seagrass_MA20_2"
-record_name <- "Water Temp.B@CACO_Seagrass_MA20_2"
+site_name <- "NCBN_OP_ERP_NY-FI"
+record_name <- "Water Temp.Water Temp@NCBN_OP_ERP_NY-FI"
 
 results <- calculate_site_metrics(site_name, record_name)
 
@@ -142,6 +212,7 @@ View(results$hourly_data)
 View(results$daily_data)
 View(results$warming_events)
 print(results$site_summary, width = Inf)
+print(results$site_summary_annual, width = Inf)
 
 # -----------------------------
 # PLOT: Hourly temps + threshold
@@ -167,6 +238,7 @@ print(temp_plot)
 # -----------------------------
 # EXPORT to Excel (with plot, metadata, and data tabs)
 # -----------------------------
+
 wb <- createWorkbook()
 
 # Data tabs
@@ -182,11 +254,16 @@ writeData(wb, "Warming Events", results$warming_events)
 addWorksheet(wb, "Site Summary")
 writeData(wb, "Site Summary", results$site_summary)
 
+
+addWorksheet(wb, "Site Summary Annual")
+writeData(wb, "Site Summary Annual", results$site_summary_annual)
+
+
 # Metadata tab
 metadata <- data.frame(
   Metric = c("HDH","CDH","Warming Event","Duration warmest period",
              "Number of warming events","Mean warming event duration",
-             "SE warming event duration","May–August filter","Aggregation","Threshold","%_abv_28.6"),
+             "SE warming event duration","May–September filter","Aggregation","Threshold","%_abv_28.6"),
   Description = c(
     "Hourly degrees above 28.6°C summed over each day",
     "Hourly degrees below 28.6°C summed over each day",
@@ -195,7 +272,7 @@ metadata <- data.frame(
     "Count of distinct daily HDH > 0 sequences(i.e., each sequence above 28.6°C counts as one warming event) ",
     "Mean length (days) of warming events",
     "Standard error of warming event durations",
-    "Only data from months 5–8 included",
+    "Only data from months 5–9 included",
     "15–30 min data averaged to hourly prior to calculations",
     "28.6°C following Berget et al. (2024)","The percentage of all recorded hours when water temperature exceeded 28.6°C during the monitoring period."
   )
@@ -207,7 +284,15 @@ writeData(wb, "Metadata", metadata)
 addWorksheet(wb, "Hourly Plot")
 insertPlot(wb, sheet = "Hourly Plot", width = 8, height = 5, fileType = "png", startRow = 1, startCol = 1)
 
+#output directory
+out_dir <- "Temp_Analysis_Annual"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
 # Save workbook
 file_name <- gsub("[:@ ]", "_", record_name)
-saveWorkbook(wb, paste0(file_name, "_WaterTempMetrics.xlsx"), overwrite = TRUE)
+path<-file.path(out_dir,paste0(file_name, "_Metrics_Annual.xlsx"))
+
+saveWorkbook(wb, path, overwrite = TRUE)
+
+
 
